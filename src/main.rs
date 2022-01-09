@@ -18,6 +18,10 @@ struct Args {
     #[clap(short = 'x', long)]
     exclude: Option<Vec<String>>,
 
+    /// Only show langauge (en, fr, ...)
+    #[clap(short = 'l', long)]
+    lang: Option<String>,
+
     /// Search on word boundary
     #[clap(short, long)]
     word: bool,
@@ -54,16 +58,29 @@ struct Entry {
     live_duration: String,
 }
 
-fn filter(entry: &Entry, word: bool, term: &str, ignored_names: &[String]) -> bool {
+fn filter(
+    entry: &Entry,
+    whole_word: bool,
+    term: &str,
+    ignored_names: &[String],
+    lang: &Option<String>,
+) -> bool {
     if ignored_names.contains(&entry.display_name.to_lowercase()) {
         return false;
     }
 
-    if word {
+    if let Some(lang) = lang {
+        if &entry.lang != lang {
+            return false;
+        }
+    }
+
+    if whole_word {
         for e in entry
             .title
             .to_lowercase()
-            .split(|c: char| !c.is_alphabetic()) {
+            .split(|c: char| !c.is_alphabetic())
+        {
             if e == term {
                 return true;
             }
@@ -285,6 +302,7 @@ fn main() {
     let args = Args::parse();
     let search_term = args.term;
     let word_boundary = args.word;
+    let lang = args.lang;
 
     let exclude = exclusions(args.exclude);
 
@@ -304,7 +322,7 @@ fn main() {
         page = next_page;
 
         for e in entries {
-            if filter(&e, word_boundary, &search_term, &exclude) {
+            if filter(&e, word_boundary, &search_term, &exclude, &lang) {
                 table.push(format_row(e));
             }
         }
