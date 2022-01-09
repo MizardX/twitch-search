@@ -1,5 +1,5 @@
-use std::env;
 use std::process::exit;
+use std::env;
 
 use chrono::prelude::*;
 use clap::Parser;
@@ -94,46 +94,92 @@ fn to_entry(value: &mut Value) -> Entry {
     }
 }
 
-fn fetch(after: Option<String>) -> (Vec<Entry>, Option<String>) {
-    let url = match after {
-        Some(after) => format!("{}&after={}", ROOT_URL, after),
-        None => ROOT_URL.to_string(),
-    };
 
-    let client_id = match env::var("TWITCH_CLIENT_ID") {
-        Ok(cid) => cid,
-        Err(_e) => {
-            eprintln!("Client id missing");
-            exit(1);
-        }
-    };
-
-    let token = match env::var("TWITCH_TOKEN") {
-        Ok(t) => t,
-        Err(_e) => {
-            eprintln!("OAuth token missing");
-            exit(1);
-        }
-    };
-
+fn configure_agent() -> ureq::Agent {
     // -----------------------------------------------------------------------------
     //     - Proxy -
     // -----------------------------------------------------------------------------
-    let proxy = env::var("https_proxy").ok()
+    let proxy = env::var("https_proxy")
+        .ok()
         .and_then(|p| ureq::Proxy::new(p).ok());
 
     let mut agent = ureq::AgentBuilder::new();
     if let Some(proxy) = proxy {
         agent = agent.proxy(proxy);
     }
-    let agent = agent.build();
+
+    agent.build()
+}
+
+fn aquire_access_token() -> String {
+    let agent = configure_agent();
+
+    // -----------------------------------------------------------------------------
+    //     - Token -
+    // -----------------------------------------------------------------------------
+    let client_id = env::var("TWITCH_CLIENT_ID").unwrap_or_else(|_| {
+        eprintln!("Client id missing. Please set the TWITCH_CLIENT_ID environment variable.");
+        exit(1);
+    });
+
+    let client_secret = env::var("TWITCH_CLIENT_SECRET").unwrap_or_else(|_| {
+        eprintln!(
+            "Client secret missing. Please set the TWITCH_CLIENT_SECRET environment variable."
+        );
+        exit(1);
+    });
+
+    let resp = agent
+        .post("https://id.twitch.tv/oauth2/token")
+        .send_form(&[
+            ("client_id", &client_id),
+            ("client_secret", &client_secret),
+            ("grant_type", "client_credentials"),
+        ])
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to get acccess token: {:?}", e);
+            exit(1);
+        });
+
+    let json = resp.into_json::<Value>().unwrap_or_else(|e| {
+        eprintln!("Failed to parse acccess token: {:?}", e);
+        exit(1);
+    });
+
+    let access_token = json
+        .get("access_token")
+        .unwrap_or_else(|| {
+            eprintln!("Failed to parse acccess token: {:?}", json);
+            exit(1);
+        })
+        .as_str()
+        .unwrap_or_else(|| {
+            eprintln!("Failed to parse acccess token: {:?}", json);
+            exit(1);
+        });
+
+    access_token.to_string()
+}
+
+fn fetch_streams(access_token: &str, after: Option<String>) -> (Vec<Entry>, Option<String>) {
+    let agent = configure_agent();
+
+    let client_id = env::var("TWITCH_CLIENT_ID").unwrap_or_else(|_| {
+        eprintln!("Client id missing. Please set the TWITCH_CLIENT_ID environment variable.");
+        exit(1);
+    });
 
     // -----------------------------------------------------------------------------
     //     - Request -
     // -----------------------------------------------------------------------------
+    let url = match after {
+        Some(after) => format!("{}&after={}", ROOT_URL, after),
+        None => ROOT_URL.to_string(),
+    };
+
     let resp = agent
         .get(&url)
-        .set("Authorization", &format!("Bearer {}", token))
+        .set("Authorization", &format!("Bearer {}", access_token))
         .set("Client-Id", &client_id)
         .call();
 
@@ -188,12 +234,14 @@ fn main() {
 
     println!("Searching for \"{}\"", search_term);
 
+    let access_token = aquire_access_token();
+
     let mut total = 0;
     let mut found = 0;
 
     let mut page = None;
     loop {
-        let (entries, p) = fetch(page);
+        let (entries, p) = fetch_streams(&access_token, page);
         total += entries.len();
         page = p;
         found += entries
