@@ -1,5 +1,5 @@
 use std::process::exit;
-use std::env;
+use std::{cmp, env};
 
 use chrono::prelude::*;
 use clap::Parser;
@@ -74,17 +74,64 @@ fn filter(entry: &Entry, word: bool, term: &str, ignored_names: &[String]) -> bo
     entry.title.to_lowercase().contains(term)
 }
 
-fn print(entry: Entry) {
-    print!("{} | ", entry.lang);
-    print!("https://twitch.tv/{:<14} | ", entry.display_name);
-    print!("{:>4} viewers | ", entry.viewer_count);
-    print!("{} | ", entry.live_duration);
-    print!("{}\n", entry.title);
+// -----------------------------------------------------------------------------
+//     - Table formatting -
+// -----------------------------------------------------------------------------
+#[allow(unused)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+enum Align {
+    Left,
+    Center,
+    Right,
 }
 
-fn to_entry(value: &mut Value) -> Entry {
-    let value = value.take();
+#[derive(Debug)]
+struct Table<const N: usize> {
+    widths: [usize; N],
+    rows: Vec<[String; N]>,
+    align: [Align; N],
+}
 
+impl<const N: usize> Table<N> {
+    fn new() -> Self {
+        Table {
+            widths: [0; N],
+            rows: Vec::new(),
+            align: [Align::Left; N],
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn set_align(&mut self, column: usize, align: Align) {
+        self.align[column] = align;
+    }
+
+    fn push(&mut self, row: [String; N]) {
+        for (i, cell) in row.iter().enumerate().take(N - 1) {
+            self.widths[i] = cmp::max(self.widths[i], cell.len());
+        }
+        self.rows.push(row);
+    }
+
+    fn print(&self) {
+        for row in &self.rows {
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..N - 1 {
+                match self.align[i] {
+                    Align::Left => print!("{0:<1$} | ", row[i], self.widths[i]),
+                    Align::Center => print!("{0:^1$} | ", row[i], self.widths[i]),
+                    Align::Right => print!("{0:>1$} | ", row[i], self.widths[i]),
+                }
+            }
+            println!("{}", row[N - 1]); // last column always left aligned
+        }
+    }
+}
+
+fn to_entry(value: &Value) -> Entry {
     Entry {
         lang: to_str!(value, "language"),
         display_name: to_str!(value, "user_name"),
@@ -94,6 +141,15 @@ fn to_entry(value: &mut Value) -> Entry {
     }
 }
 
+fn format_row(entry: Entry) -> [String; 5] {
+    [
+        entry.lang,
+        format!("https://twitch.tv/{}", entry.display_name),
+        format!("{} viewers", entry.viewer_count),
+        entry.live_duration,
+        entry.title.replace(|c: char| c.is_control(), " "),
+    ]
+}
 
 fn configure_agent() -> ureq::Agent {
     // -----------------------------------------------------------------------------
@@ -181,25 +237,25 @@ fn fetch_streams(access_token: &str, after: Option<String>) -> (Vec<Entry>, Opti
         .get(&url)
         .set("Authorization", &format!("Bearer {}", access_token))
         .set("Client-Id", &client_id)
-        .call();
-
-    let mut json: Value = match resp.unwrap().into_json() {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("failed to serialize json: {:?}", e);
+        .call()
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to get streams: {:?}", e);
             exit(1);
-        }
-    };
+        });
+
+    let json: Value = resp.into_json().unwrap_or_else(|e| {
+        eprintln!("Failed to deserialize json: {:?}", e);
+        exit(1);
+    });
 
     let pagination = json
-        .get_mut("pagination")
-        .take()
-        .and_then(|v| v.get("cursor").take())
+        .get("pagination")
+        .and_then(|v| v.get("cursor"))
         .and_then(|v| v.as_str())
         .map(|v| v.to_string());
 
-    let data = match json.get_mut("data") {
-        Some(Value::Array(a)) => a.iter_mut().map(to_entry).collect::<Vec<_>>(),
+    let data = match json.get("data") {
+        Some(Value::Array(a)) => a.iter().map(to_entry).collect::<Vec<_>>(),
         _ => exit(0),
     };
 
@@ -236,24 +292,29 @@ fn main() {
 
     let access_token = aquire_access_token();
 
-    let mut total = 0;
-    let mut found = 0;
+    let mut table: Table<5> = Table::new();
+    table.set_align(2, Align::Right);
+    table.set_align(3, Align::Right);
 
+    let mut total = 0;
     let mut page = None;
     loop {
-        let (entries, p) = fetch_streams(&access_token, page);
+        let (entries, next_page) = fetch_streams(&access_token, page);
         total += entries.len();
-        page = p;
-        found += entries
-            .into_iter()
-            .filter(|e| filter(e, word_boundary, &search_term, &exclude))
-            .map(|e| print(e))
-            .count();
+        page = next_page;
+
+        for e in entries {
+            if filter(&e, word_boundary, &search_term, &exclude) {
+                table.push(format_row(e));
+            }
+        }
 
         if page.is_none() {
             break;
         }
     }
 
-    println!("Done ({}/{})", found, total);
+    table.print();
+
+    println!("Done ({}/{})", table.len(), total);
 }
