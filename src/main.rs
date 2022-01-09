@@ -5,12 +5,13 @@ use chrono::prelude::*;
 use clap::Parser;
 use serde_json::Value;
 
-const ROOT_URL: &str = "https://api.twitch.tv/helix/streams?first=100;game_id=1469308723";
+const ROOT_URL: &str = "https://api.twitch.tv/helix/streams?first=100&game_id=1469308723";
 
 #[derive(Parser, Debug)]
 #[clap(about, version, author)]
 struct Args {
     /// Term to search for
+    #[clap(default_value = "")]
     term: String,
 
     /// Streamers to exclude
