@@ -12,7 +12,7 @@ const ROOT_URL: &str = "https://api.twitch.tv/helix/streams?first=100&game_id=14
 struct Args {
     /// Term to search for
     #[clap(default_value = "")]
-    term: String,
+    term: Vec<String>,
 
     /// Streamers to exclude
     #[clap(short = 'x', long)]
@@ -21,6 +21,10 @@ struct Args {
     /// Only show langauge (en, fr, ...)
     #[clap(short = 'l', long)]
     lang: Option<String>,
+
+    /// Require matching all words, instead of just any
+    #[clap(short, long)]
+    all: bool,
 
     /// Search on word boundary
     #[clap(short, long)]
@@ -61,7 +65,8 @@ struct Entry {
 fn filter(
     entry: &Entry,
     whole_word: bool,
-    term: &str,
+    all: bool,
+    term: &[String],
     ignored_names: &[String],
     lang: &Option<String>,
 ) -> bool {
@@ -81,14 +86,19 @@ fn filter(
             .to_lowercase()
             .split(|c: char| !c.is_alphabetic())
         {
-            if e == term {
+            if term.iter().any(|t| t.eq(e)) {
                 return true;
             }
         }
         return false;
     }
 
-    entry.title.to_lowercase().contains(term)
+    let lower_title = entry.title.to_lowercase();
+    if all {
+        term.iter().all(|t| lower_title.contains(t))
+    } else {
+        term.iter().any(|t| lower_title.contains(t))
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -302,11 +312,12 @@ fn main() {
     let args = Args::parse();
     let search_term = args.term;
     let word_boundary = args.word;
+    let all = args.all;
     let lang = args.lang;
 
     let exclude = exclusions(args.exclude);
 
-    println!("Searching for \"{}\"", search_term);
+    println!("Searching for {search_term:?}");
 
     let access_token = aquire_access_token();
 
@@ -322,7 +333,7 @@ fn main() {
         page = next_page;
 
         for e in entries {
-            if filter(&e, word_boundary, &search_term, &exclude, &lang) {
+            if filter(&e, word_boundary, all, &search_term, &exclude, &lang) {
                 table.push(format_row(e));
             }
         }
