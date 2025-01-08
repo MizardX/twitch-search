@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::{cmp, env};
 
 use chrono::prelude::*;
@@ -364,6 +365,10 @@ fn run() -> Result<(), AppError> {
     let mut page = None;
     loop {
         let (entries, next_page) = fetch_streams(&access_token, page)?;
+
+        print!(".");
+        std::io::stdout().flush()?;
+
         total += entries.len();
         page = next_page;
 
@@ -377,6 +382,7 @@ fn run() -> Result<(), AppError> {
             break;
         }
     }
+    println!();
 
     table.print();
 
