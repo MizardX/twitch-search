@@ -58,7 +58,7 @@ impl From<ureq::Error> for AppError {
 }
 
 const ROOT_URL: &str =
-    "https://api.twitch.tv/helix/streams?first=100&game_id=1469308723";
+    "https://api.twitch.tv/helix/streams?first=100&game_id=1469308723&game_id=509658";
 
 // -----------------------------------------------------------------------------
 //     - Command line arguments -
