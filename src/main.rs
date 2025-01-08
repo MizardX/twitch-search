@@ -1,11 +1,67 @@
-use std::process::exit;
 use std::{cmp, env};
 
 use chrono::prelude::*;
 use clap::Parser;
 use serde_json::Value;
+use thiserror::Error;
 
-const ROOT_URL: &str = "https://api.twitch.tv/helix/streams?first=100&game_id=1469308723";
+#[derive(Debug, Error)]
+enum AccessTokenError {
+    #[error("Client id missing. Please set the TWITCH_CLIENT_ID environment variable.")]
+    MissingClientId,
+
+    #[error("Client secret missing. Please set the TWITCH_CLIENT_SECRET environment variable.")]
+    MissingClientSecret,
+
+    #[error("Failed to get acccess token: {0}")]
+    RequestError(Box<ureq::Error>),
+
+    #[error("Failed to read acccess token: {0}")]
+    ReadError(#[from] std::io::Error),
+
+    #[error("Failed to parse acccess token: {0}")]
+    ParseAccessTokenJson(#[from] serde_json::Error),
+
+    #[error("Failed to parse acccess token.")]
+    ParseAccessToken,
+}
+
+impl From<ureq::Error> for AccessTokenError {
+    fn from(e: ureq::Error) -> Self {
+        AccessTokenError::RequestError(Box::new(e))
+    }
+}
+
+#[derive(Debug, Error)]
+enum AppError {
+    #[error(transparent)]
+    AccessToken(#[from] AccessTokenError),
+
+    #[error("Failed to get streams: {0}")]
+    FetchStreams(Box<ureq::Error>),
+
+    #[error("Failed to read streams: {0}")]
+    ReadStreams(#[from] std::io::Error),
+
+    #[error("Failed to deserialize json: {0}")]
+    DeserializeJson(#[from] serde_json::Error),
+
+    #[error("Failed to parse json.")]
+    ParseJson,
+}
+
+impl From<ureq::Error> for AppError {
+    fn from(e: ureq::Error) -> Self {
+        AppError::FetchStreams(Box::new(e))
+    }
+}
+
+const ROOT_URL: &str =
+    "https://api.twitch.tv/helix/streams?first=100&game_id=1469308723";
+
+// -----------------------------------------------------------------------------
+//     - Command line arguments -
+// -----------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
 #[clap(about, version, author)]
@@ -31,6 +87,70 @@ struct Args {
     word: bool,
 }
 
+// -----------------------------------------------------------------------------
+//     - Table formatting -
+// -----------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct Entry {
+    lang: String,
+    display_name: String,
+    title: String,
+    viewer_count: i64,
+    live_duration: String,
+}
+
+impl Entry {
+    fn matches(
+        &self,
+        whole_word: bool,
+        all: bool,
+        term: &[String],
+        ignored_names: &[String],
+        lang: &Option<String>,
+    ) -> bool {
+        if ignored_names.contains(&self.display_name.to_lowercase()) {
+            return false;
+        }
+
+        if let Some(lang) = lang {
+            if &self.lang != lang {
+                return false;
+            }
+        }
+
+        if whole_word {
+            for e in self
+                .title
+                .to_lowercase()
+                .split(|c: char| !c.is_alphabetic())
+            {
+                if term.iter().any(|t| t.eq(e)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        let lower_title = self.title.to_lowercase();
+        if all {
+            term.iter().all(|t| lower_title.contains(t))
+        } else {
+            term.iter().any(|t| lower_title.contains(t))
+        }
+    }
+
+    fn format_row(self) -> [String; 5] {
+        [
+            self.lang,
+            format!("https://twitch.tv/{}", self.display_name),
+            format!("{} viewers", self.viewer_count),
+            self.live_duration,
+            self.title.replace(|c: char| c.is_control(), " "),
+        ]
+    }
+}
+
 macro_rules! to_str {
     ($val: expr, $key: expr) => {
         $val.get($key).unwrap().as_str().unwrap().to_string()
@@ -53,57 +173,18 @@ fn to_instant(ds: &str) -> String {
     }
 }
 
-#[derive(Debug)]
-struct Entry {
-    lang: String,
-    display_name: String,
-    title: String,
-    viewer_count: i64,
-    live_duration: String,
-}
-
-fn filter(
-    entry: &Entry,
-    whole_word: bool,
-    all: bool,
-    term: &[String],
-    ignored_names: &[String],
-    lang: &Option<String>,
-) -> bool {
-    if ignored_names.contains(&entry.display_name.to_lowercase()) {
-        return false;
-    }
-
-    if let Some(lang) = lang {
-        if &entry.lang != lang {
-            return false;
+impl From<&Value> for Entry {
+    fn from(value: &Value) -> Self {
+        Entry {
+            lang: to_str!(value, "language"),
+            display_name: to_str!(value, "user_name"),
+            title: to_str!(value, "title"),
+            viewer_count: to_num!(value, "viewer_count"),
+            live_duration: to_instant(&to_str!(value, "started_at")),
         }
-    }
-
-    if whole_word {
-        for e in entry
-            .title
-            .to_lowercase()
-            .split(|c: char| !c.is_alphabetic())
-        {
-            if term.iter().any(|t| t.eq(e)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    let lower_title = entry.title.to_lowercase();
-    if all {
-        term.iter().all(|t| lower_title.contains(t))
-    } else {
-        term.iter().any(|t| lower_title.contains(t))
     }
 }
 
-// -----------------------------------------------------------------------------
-//     - Table formatting -
-// -----------------------------------------------------------------------------
 #[allow(unused)]
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum Align {
@@ -114,17 +195,17 @@ enum Align {
 
 #[derive(Debug)]
 struct Table<const N: usize> {
+    align: [Align; N],
     widths: [usize; N],
     rows: Vec<[String; N]>,
-    align: [Align; N],
 }
 
 impl<const N: usize> Table<N> {
     fn new() -> Self {
         Table {
+            align: [Align::Left; N],
             widths: [0; N],
             rows: Vec::new(),
-            align: [Align::Left; N],
         }
     }
 
@@ -137,20 +218,19 @@ impl<const N: usize> Table<N> {
     }
 
     fn push(&mut self, row: [String; N]) {
-        for (i, cell) in row.iter().enumerate().take(N - 1) {
-            self.widths[i] = cmp::max(self.widths[i], cell.len());
+        for (width, cell) in self.widths.iter_mut().zip(&row).take(N - 1) {
+            *width = cmp::max(*width, cell.len());
         }
         self.rows.push(row);
     }
 
     fn print(&self) {
         for row in &self.rows {
-            #[allow(clippy::needless_range_loop)]
-            for i in 0..N - 1 {
-                match self.align[i] {
-                    Align::Left => print!("{0:<1$} | ", row[i], self.widths[i]),
-                    Align::Center => print!("{0:^1$} | ", row[i], self.widths[i]),
-                    Align::Right => print!("{0:>1$} | ", row[i], self.widths[i]),
+            for ((align, row), width) in self.align.iter().zip(row).zip(self.widths).take(N - 1) {
+                match align {
+                    Align::Left => print!("{row:<width$} | "),
+                    Align::Center => print!("{row:^width$} | "),
+                    Align::Right => print!("{row:>width$} | "),
                 }
             }
             println!("{}", row[N - 1]); // last column always left aligned
@@ -158,30 +238,11 @@ impl<const N: usize> Table<N> {
     }
 }
 
-fn to_entry(value: &Value) -> Entry {
-    Entry {
-        lang: to_str!(value, "language"),
-        display_name: to_str!(value, "user_name"),
-        title: to_str!(value, "title"),
-        viewer_count: to_num!(value, "viewer_count"),
-        live_duration: to_instant(&to_str!(value, "started_at")),
-    }
-}
-
-fn format_row(entry: Entry) -> [String; 5] {
-    [
-        entry.lang,
-        format!("https://twitch.tv/{}", entry.display_name),
-        format!("{} viewers", entry.viewer_count),
-        entry.live_duration,
-        entry.title.replace(|c: char| c.is_control(), " "),
-    ]
-}
+// -----------------------------------------------------------------------------
+//     - Request and parsing -
+// -----------------------------------------------------------------------------
 
 fn configure_agent() -> ureq::Agent {
-    // -----------------------------------------------------------------------------
-    //     - Proxy -
-    // -----------------------------------------------------------------------------
     let proxy = env::var("https_proxy")
         .ok()
         .and_then(|p| ureq::Proxy::new(p).ok());
@@ -194,23 +255,13 @@ fn configure_agent() -> ureq::Agent {
     agent.build()
 }
 
-fn aquire_access_token() -> String {
+fn aquire_access_token() -> Result<String, AccessTokenError> {
     let agent = configure_agent();
 
-    // -----------------------------------------------------------------------------
-    //     - Token -
-    // -----------------------------------------------------------------------------
-    let client_id = env::var("TWITCH_CLIENT_ID").unwrap_or_else(|_| {
-        eprintln!("Client id missing. Please set the TWITCH_CLIENT_ID environment variable.");
-        exit(1);
-    });
+    let client_id = env::var("TWITCH_CLIENT_ID").map_err(|_| AccessTokenError::MissingClientId)?;
 
-    let client_secret = env::var("TWITCH_CLIENT_SECRET").unwrap_or_else(|_| {
-        eprintln!(
-            "Client secret missing. Please set the TWITCH_CLIENT_SECRET environment variable."
-        );
-        exit(1);
-    });
+    let client_secret =
+        env::var("TWITCH_CLIENT_SECRET").map_err(|_| AccessTokenError::MissingClientSecret)?;
 
     let resp = agent
         .post("https://id.twitch.tv/oauth2/token")
@@ -218,43 +269,27 @@ fn aquire_access_token() -> String {
             ("client_id", &client_id),
             ("client_secret", &client_secret),
             ("grant_type", "client_credentials"),
-        ])
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to get acccess token: {:?}", e);
-            exit(1);
-        });
+        ])?;
 
-    let json = resp.into_json::<Value>().unwrap_or_else(|e| {
-        eprintln!("Failed to parse acccess token: {:?}", e);
-        exit(1);
-    });
+    let json = resp.into_json::<Value>()?;
 
     let access_token = json
         .get("access_token")
-        .unwrap_or_else(|| {
-            eprintln!("Failed to parse acccess token: {:?}", json);
-            exit(1);
-        })
+        .ok_or(AccessTokenError::ParseAccessToken)?
         .as_str()
-        .unwrap_or_else(|| {
-            eprintln!("Failed to parse acccess token: {:?}", json);
-            exit(1);
-        });
+        .ok_or(AccessTokenError::ParseAccessToken)?;
 
-    access_token.to_string()
+    Ok(access_token.to_string())
 }
 
-fn fetch_streams(access_token: &str, after: Option<String>) -> (Vec<Entry>, Option<String>) {
+fn fetch_streams(
+    access_token: &str,
+    after: Option<String>,
+) -> Result<(Vec<Entry>, Option<String>), AppError> {
     let agent = configure_agent();
 
-    let client_id = env::var("TWITCH_CLIENT_ID").unwrap_or_else(|_| {
-        eprintln!("Client id missing. Please set the TWITCH_CLIENT_ID environment variable.");
-        exit(1);
-    });
+    let client_id = env::var("TWITCH_CLIENT_ID").map_err(|_| AccessTokenError::MissingClientId)?;
 
-    // -----------------------------------------------------------------------------
-    //     - Request -
-    // -----------------------------------------------------------------------------
     let url = match after {
         Some(after) => format!("{}&after={}", ROOT_URL, after),
         None => ROOT_URL.to_string(),
@@ -264,16 +299,9 @@ fn fetch_streams(access_token: &str, after: Option<String>) -> (Vec<Entry>, Opti
         .get(&url)
         .set("Authorization", &format!("Bearer {}", access_token))
         .set("Client-Id", &client_id)
-        .call()
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to get streams: {:?}", e);
-            exit(1);
-        });
+        .call()?;
 
-    let json: Value = resp.into_json().unwrap_or_else(|e| {
-        eprintln!("Failed to deserialize json: {:?}", e);
-        exit(1);
-    });
+    let json: Value = resp.into_json()?;
 
     let pagination = json
         .get("pagination")
@@ -282,11 +310,11 @@ fn fetch_streams(access_token: &str, after: Option<String>) -> (Vec<Entry>, Opti
         .map(|v| v.to_string());
 
     let data = match json.get("data") {
-        Some(Value::Array(a)) => a.iter().map(to_entry).collect::<Vec<_>>(),
-        _ => exit(0),
+        Some(Value::Array(a)) => a.iter().map(Into::into).collect::<Vec<_>>(),
+        _ => Err(AppError::ParseJson)?,
     };
 
-    (data, pagination)
+    Ok((data, pagination))
 }
 
 // -----------------------------------------------------------------------------
@@ -308,18 +336,25 @@ fn exclusions(exclude: Option<Vec<String>>) -> Vec<String> {
 // -----------------------------------------------------------------------------
 //     - Main -
 // -----------------------------------------------------------------------------
+
 fn main() {
+    run().unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+}
+fn run() -> Result<(), AppError> {
     let args = Args::parse();
-    let search_term = args.term;
+    let search_terms = args.term;
     let word_boundary = args.word;
     let all = args.all;
     let lang = args.lang;
 
     let exclude = exclusions(args.exclude);
 
-    println!("Searching for {search_term:?}");
+    println!("Searching for {search_terms:?}");
 
-    let access_token = aquire_access_token();
+    let access_token = aquire_access_token()?;
 
     let mut table: Table<5> = Table::new();
     table.set_align(2, Align::Right);
@@ -328,13 +363,13 @@ fn main() {
     let mut total = 0;
     let mut page = None;
     loop {
-        let (entries, next_page) = fetch_streams(&access_token, page);
+        let (entries, next_page) = fetch_streams(&access_token, page)?;
         total += entries.len();
         page = next_page;
 
-        for e in entries {
-            if filter(&e, word_boundary, all, &search_term, &exclude, &lang) {
-                table.push(format_row(e));
+        for entry in entries {
+            if entry.matches(word_boundary, all, &search_terms, &exclude, &lang) {
+                table.push(entry.format_row());
             }
         }
 
@@ -345,5 +380,8 @@ fn main() {
 
     table.print();
 
-    println!("Done ({}/{})", table.len(), total);
+    let matched = table.len();
+    println!("Done ({matched}/{total})");
+
+    Ok(())
 }
