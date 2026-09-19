@@ -1,10 +1,16 @@
-use std::io::Write;
+use std::io::{self, Write};
 use std::{cmp, env};
 
+use chrono::Duration;
 use chrono::prelude::*;
 use clap::Parser;
 use serde_json::Value;
 use thiserror::Error;
+use ureq::Response;
+
+// -----------------------------------------------------------------------------
+//     - Errors -
+// -----------------------------------------------------------------------------
 
 #[derive(Debug, Error)]
 enum AccessTokenError {
@@ -57,9 +63,6 @@ impl From<ureq::Error> for AppError {
     }
 }
 
-const ROOT_URL: &str =
-    "https://api.twitch.tv/helix/streams?first=100&game_id=1469308723&game_id=509658";
-
 // -----------------------------------------------------------------------------
 //     - Command line arguments -
 // -----------------------------------------------------------------------------
@@ -67,11 +70,11 @@ const ROOT_URL: &str =
 #[derive(Parser, Debug)]
 #[clap(about, version, author)]
 struct Args {
-    /// Term to search for
+    /// Terms to search for
     #[clap(default_value = "")]
     term: Vec<String>,
 
-    /// Streamers to exclude
+    /// Streamers to exclude, combined with the TWITCH_IGNORE environment variable
     #[clap(short = 'x', long)]
     exclude: Option<Vec<String>>,
 
@@ -89,7 +92,90 @@ struct Args {
 }
 
 // -----------------------------------------------------------------------------
-//     - Table formatting -
+//     - Filtering -
+// -----------------------------------------------------------------------------
+
+struct Filter {
+    /// Terms to search for
+    search_terms: Vec<String>,
+    /// Search on word boundary
+    word_boundary: bool,
+    /// Require matching all words, instead of just any
+    all: bool,
+    /// Only show language (en, fr, ...)
+    lang: Option<String>,
+    /// Streamers to exclude
+    exclude: Vec<String>,
+}
+
+impl Filter {
+    fn from_args(args: Args) -> Self {
+        let mut exclude = args.exclude.unwrap_or_default();
+
+        if let Ok(ignore_list) = env::var("TWITCH_IGNORE") {
+            exclude.extend(ignore_list.split(',').map(str::to_string));
+        }
+
+        Filter {
+            exclude,
+            search_terms: args.term,
+            word_boundary: args.word,
+            all: args.all,
+            lang: args.lang,
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+//     - String comparison -
+// -----------------------------------------------------------------------------
+
+trait IgnoreCase {
+    fn eq_ignore_case(&self, other: &str) -> bool;
+    fn contains_ignore_case(&self, needle: &str) -> bool;
+}
+
+impl IgnoreCase for str {
+    // Compares char-by-char via `to_lowercase()` iterators, so no owned lowercased copy is needed.
+    fn eq_ignore_case(&self, other: &str) -> bool {
+        self.chars()
+            .flat_map(char::to_lowercase)
+            .eq(other.chars().flat_map(char::to_lowercase))
+    }
+
+    fn contains_ignore_case(&self, needle: &str) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+
+        let mut rest = self;
+        loop {
+            let mut h = rest.chars().flat_map(char::to_lowercase);
+            let mut n = needle.chars().flat_map(char::to_lowercase);
+            let matched = loop {
+                match n.next() {
+                    None => break true,
+                    Some(nc) => match h.next() {
+                        Some(hc) if hc == nc => continue,
+                        _ => break false,
+                    },
+                }
+            };
+            if matched {
+                return true;
+            }
+
+            let mut chars = rest.chars();
+            if chars.next().is_none() {
+                return false;
+            }
+            rest = chars.as_str();
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+//     - Entry -
 // -----------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -98,63 +184,62 @@ struct Entry {
     display_name: String,
     title: String,
     viewer_count: i64,
-    live_duration: String,
+    live_duration: Option<Duration>,
 }
 
 impl Entry {
-    fn matches(
-        &self,
-        whole_word: bool,
-        all: bool,
-        term: &[String],
-        ignored_names: &[String],
-        lang: &Option<String>,
-    ) -> bool {
-        if ignored_names.contains(&self.display_name.to_lowercase()) {
+    fn matches(&self, filter: &Filter) -> bool {
+        if filter
+            .exclude
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case(&self.display_name))
+        {
             return false;
         }
 
-        if let Some(lang) = lang {
-            if &self.lang != lang {
-                return false;
-            }
+        if let Some(lang) = &filter.lang
+            && &self.lang != lang
+        {
+            return false;
         }
 
-        if whole_word {
-            for e in self
-                .title
-                .to_lowercase()
+        // fn items don't capture their environment, so both branches coerce to the same fn pointer type.
+        fn whole_word(title: &str, term: &str) -> bool {
+            title
                 .split(|c: char| !c.is_alphabetic())
-            {
-                if term.iter().any(|t| t.eq(e)) {
-                    return true;
-                }
-            }
-            return false;
+                .any(|token| token.eq_ignore_case(term))
         }
 
-        let lower_title = self.title.to_lowercase();
-        if all {
-            term.iter().all(|t| lower_title.contains(t))
+        fn substring(title: &str, term: &str) -> bool {
+            title.contains_ignore_case(term)
+        }
+
+        let is_match: fn(&str, &str) -> bool = if filter.word_boundary {
+            whole_word
         } else {
-            term.iter().any(|t| lower_title.contains(t))
-        }
-    }
+            substring
+        };
 
-    fn format_row(self) -> [String; 5] {
-        [
-            self.lang,
-            format!("https://twitch.tv/{}", self.display_name),
-            format!("{} viewers", self.viewer_count),
-            self.live_duration,
-            self.title.replace(|c: char| c.is_control(), " "),
-        ]
+        if filter.all {
+            filter
+                .search_terms
+                .iter()
+                .all(|term| is_match(&self.title, term))
+        } else {
+            filter
+                .search_terms
+                .iter()
+                .any(|term| is_match(&self.title, term))
+        }
     }
 }
 
-macro_rules! to_str {
-    ($val: expr, $key: expr) => {
-        $val.get($key).unwrap().as_str().unwrap().to_string()
+macro_rules! take_str {
+    ($val: expr, $key: expr, $err: expr) => {
+        match $val.get_mut($key).map(Value::take) {
+            Some(Value::String(s)) => s,
+            _ => return Err($err),
+        }
     };
 }
 
@@ -164,27 +249,28 @@ macro_rules! to_num {
     };
 }
 
-fn to_instant(ds: &str) -> String {
-    match ds.parse::<DateTime<Utc>>() {
-        Ok(val) => {
-            let dur = Utc::now() - val;
-            format!("{:02}:{:02}", dur.num_hours(), dur.num_minutes() % 60)
-        }
-        Err(_e) => "".to_string(),
+fn to_instant(ds: &str) -> Option<Duration> {
+    let val = ds.parse::<DateTime<Utc>>().ok()?;
+    Some(Utc::now() - val)
+}
+
+impl TryFrom<&mut Value> for Entry {
+    type Error = AppError;
+
+    fn try_from(value: &mut Value) -> Result<Self, Self::Error> {
+        Ok(Entry {
+            lang: take_str!(value, "language", AppError::ParseJson),
+            display_name: take_str!(value, "user_name", AppError::ParseJson),
+            title: take_str!(value, "title", AppError::ParseJson),
+            viewer_count: to_num!(value, "viewer_count"),
+            live_duration: to_instant(&take_str!(value, "started_at", AppError::ParseJson)),
+        })
     }
 }
 
-impl From<&Value> for Entry {
-    fn from(value: &Value) -> Self {
-        Entry {
-            lang: to_str!(value, "language"),
-            display_name: to_str!(value, "user_name"),
-            title: to_str!(value, "title"),
-            viewer_count: to_num!(value, "viewer_count"),
-            live_duration: to_instant(&to_str!(value, "started_at")),
-        }
-    }
-}
+// -----------------------------------------------------------------------------
+//     - Table formatting -
+// -----------------------------------------------------------------------------
 
 #[allow(unused)]
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -194,18 +280,19 @@ enum Align {
     Right,
 }
 
+// Columns: 0 = lang, 1 = url, 2 = viewers, 3 = duration, 4 (unpadded) = title.
 #[derive(Debug)]
-struct Table<const N: usize> {
-    align: [Align; N],
-    widths: [usize; N],
-    rows: Vec<[String; N]>,
+struct Table {
+    align: [Align; 4],
+    widths: [usize; 4],
+    rows: Vec<Entry>,
 }
 
-impl<const N: usize> Table<N> {
+impl Table {
     fn new() -> Self {
         Table {
-            align: [Align::Left; N],
-            widths: [0; N],
+            align: [Align::Left; 4],
+            widths: [0; 4],
             rows: Vec::new(),
         }
     }
@@ -218,30 +305,119 @@ impl<const N: usize> Table<N> {
         self.align[column] = align;
     }
 
-    fn push(&mut self, row: [String; N]) {
-        for (width, cell) in self.widths.iter_mut().zip(&row).take(N - 1) {
-            *width = cmp::max(*width, cell.len());
+    fn push(&mut self, entry: Entry) {
+        let cell_widths = [
+            entry.lang.len(),
+            "https://twitch.tv/".len() + entry.display_name.len(),
+            Self::digit_count(entry.viewer_count) + " viewers".len(),
+            Self::duration_width(&entry.live_duration),
+        ];
+        for (width, cell) in self.widths.iter_mut().zip(cell_widths) {
+            *width = cmp::max(*width, cell);
         }
-        self.rows.push(row);
+        self.rows.push(entry);
     }
 
-    fn print(&self) {
-        for row in &self.rows {
-            for ((align, row), width) in self.align.iter().zip(row).zip(self.widths).take(N - 1) {
-                match align {
-                    Align::Left => print!("{row:<width$} | "),
-                    Align::Center => print!("{row:^width$} | "),
-                    Align::Right => print!("{row:>width$} | "),
-                }
-            }
-            println!("{}", row[N - 1]); // last column always left aligned
+    fn digit_count(n: i64) -> usize {
+        if n == 0 {
+            return 1;
         }
+        let mut n = n.unsigned_abs();
+        let mut count = 0;
+        while n > 0 {
+            count += 1;
+            n /= 10;
+        }
+        count
+    }
+
+    // Width of "HH:MM", where HH is at least 2 digits but grows for longer streams.
+    fn duration_width(duration: &Option<Duration>) -> usize {
+        match duration {
+            Some(d) => Self::digit_count(d.num_hours()).max(2) + 1 + 2,
+            None => 0,
+        }
+    }
+
+    fn write_aligned(
+        out: &mut impl Write,
+        align: Align,
+        width: usize,
+        value: impl std::fmt::Display,
+    ) -> io::Result<()> {
+        match align {
+            Align::Left => write!(out, "{value:<width$} | "),
+            Align::Center => write!(out, "{value:^width$} | "),
+            Align::Right => write!(out, "{value:>width$} | "),
+        }
+    }
+
+    fn print(&self) -> io::Result<()> {
+        let stdout = io::stdout();
+        let mut out = io::BufWriter::new(stdout.lock());
+
+        for entry in &self.rows {
+            Self::write_aligned(&mut out, self.align[0], self.widths[0], &entry.lang)?;
+            Self::write_aligned(
+                &mut out,
+                self.align[1],
+                self.widths[1],
+                format_args!("https://twitch.tv/{}", entry.display_name),
+            )?;
+            Self::write_aligned(
+                &mut out,
+                self.align[2],
+                self.widths[2],
+                format_args!("{} viewers", entry.viewer_count),
+            )?;
+            match &entry.live_duration {
+                Some(d) => Self::write_aligned(
+                    &mut out,
+                    self.align[3],
+                    self.widths[3],
+                    format_args!("{:02}:{:02}", d.num_hours(), d.num_minutes() % 60),
+                )?,
+                None => Self::write_aligned(&mut out, self.align[3], self.widths[3], "")?,
+            }
+            for c in entry.title.chars() {
+                write!(out, "{}", if c.is_control() { ' ' } else { c })?;
+            }
+            writeln!(out)?;
+        }
+
+        out.flush()
     }
 }
 
 // -----------------------------------------------------------------------------
-//     - Request and parsing -
+//     - Twitch API -
 // -----------------------------------------------------------------------------
+
+const ROOT_URL: &str =
+    "https://api.twitch.tv/helix/streams?first=100&game_id=1469308723&game_id=509658";
+
+// Reuses one String buffer across pages instead of allocating a new URL each time.
+struct StreamsUrl {
+    buf: String,
+    base_len: usize,
+}
+
+impl StreamsUrl {
+    fn new() -> Self {
+        let buf = String::from(ROOT_URL);
+        let base_len = buf.len();
+        StreamsUrl { buf, base_len }
+    }
+
+    fn set_after(&mut self, after: Option<&str>) -> &str {
+        self.buf.truncate(self.base_len);
+        if let Some(after) = after {
+            self.buf.push_str("&after=");
+            self.buf.push_str(after);
+        }
+        &self.buf
+    }
+}
 
 fn configure_agent() -> ureq::Agent {
     let proxy = env::var("https_proxy")
@@ -256,82 +432,170 @@ fn configure_agent() -> ureq::Agent {
     agent.build()
 }
 
-fn aquire_access_token() -> Result<String, AccessTokenError> {
-    let agent = configure_agent();
-
-    let client_id = env::var("TWITCH_CLIENT_ID").map_err(|_| AccessTokenError::MissingClientId)?;
-
-    let client_secret =
-        env::var("TWITCH_CLIENT_SECRET").map_err(|_| AccessTokenError::MissingClientSecret)?;
-
-    let resp = agent
-        .post("https://id.twitch.tv/oauth2/token")
-        .send_form(&[
-            ("client_id", &client_id),
-            ("client_secret", &client_secret),
-            ("grant_type", "client_credentials"),
-        ])?;
-
-    let json = resp.into_json::<Value>()?;
-
-    let access_token = json
-        .get("access_token")
-        .ok_or(AccessTokenError::ParseAccessToken)?
-        .as_str()
-        .ok_or(AccessTokenError::ParseAccessToken)?;
-
-    Ok(access_token.to_string())
+struct Limits {
+    limit: i64,
+    remaining: i64,
+    reset: DateTime<Utc>,
 }
 
-fn fetch_streams(
-    access_token: &str,
-    after: Option<String>,
-) -> Result<(Vec<Entry>, Option<String>), AppError> {
-    let agent = configure_agent();
-
-    let client_id = env::var("TWITCH_CLIENT_ID").map_err(|_| AccessTokenError::MissingClientId)?;
-
-    let url = match after {
-        Some(after) => format!("{}&after={}", ROOT_URL, after),
-        None => ROOT_URL.to_string(),
-    };
-
-    let resp = agent
-        .get(&url)
-        .set("Authorization", &format!("Bearer {}", access_token))
-        .set("Client-Id", &client_id)
-        .call()?;
-
-    let json: Value = resp.into_json()?;
-
-    let pagination = json
-        .get("pagination")
-        .and_then(|v| v.get("cursor"))
-        .and_then(|v| v.as_str())
-        .map(|v| v.to_string());
-
-    let data = match json.get("data") {
-        Some(Value::Array(a)) => a.iter().map(Into::into).collect::<Vec<_>>(),
-        _ => Err(AppError::ParseJson)?,
-    };
-
-    Ok((data, pagination))
-}
-
-// -----------------------------------------------------------------------------
-//     - Excluded terms -
-// -----------------------------------------------------------------------------
-fn exclusions(exclude: Option<Vec<String>>) -> Vec<String> {
-    let mut excluded = match exclude {
-        Some(exclusions) => exclusions.iter().map(|x| x.to_lowercase()).collect(),
-        None => vec![],
-    };
-
-    if let Ok(ignore_list) = env::var("TWITCH_IGNORE") {
-        excluded.extend(ignore_list.split(',').map(str::to_lowercase));
+impl Limits {
+    fn from_response(resp: &Response) -> Option<Self> {
+        Some(Self {
+            limit: resp.header("Ratelimit-Limit")?.parse::<i64>().ok()?,
+            remaining: resp.header("Ratelimit-Remaining")?.parse::<i64>().ok()?,
+            reset: DateTime::from_timestamp(
+                resp.header("Ratelimit-Reset")?.parse::<i64>().ok()?,
+                0,
+            )?,
+        })
     }
 
-    excluded
+    fn print_warning_if_low(&self) {
+        if self.remaining < 100 {
+            println!(
+                "{} of {} used, reset in {}",
+                self.remaining,
+                self.limit,
+                self.reset.signed_duration_since(Local::now())
+            );
+        }
+    }
+}
+
+struct FetchStreams {
+    entries: Vec<Entry>,
+    next_page: Option<String>,
+    limits: Option<Limits>,
+}
+
+/// Bundles the Twitch API connection with the search filter and result table.
+struct TwitchClient {
+    agent: ureq::Agent,
+    client_id: String,
+    auth_header: String,
+    url: StreamsUrl,
+    filter: Filter,
+    table: Table,
+}
+
+impl TwitchClient {
+    fn new(filter: Filter) -> Result<Self, AccessTokenError> {
+        let agent = configure_agent();
+        let client_id =
+            env::var("TWITCH_CLIENT_ID").map_err(|_| AccessTokenError::MissingClientId)?;
+        let access_token = Self::aquire_access_token(&agent, &client_id)?;
+
+        let mut table = Table::new();
+        table.set_align(2, Align::Right);
+        table.set_align(3, Align::Right);
+
+        Ok(Self {
+            agent,
+            client_id,
+            auth_header: format!("Bearer {}", access_token),
+            url: StreamsUrl::new(),
+            filter,
+            table,
+        })
+    }
+
+    fn aquire_access_token(
+        agent: &ureq::Agent,
+        client_id: &str,
+    ) -> Result<String, AccessTokenError> {
+        let client_secret =
+            env::var("TWITCH_CLIENT_SECRET").map_err(|_| AccessTokenError::MissingClientSecret)?;
+
+        let resp = agent
+            .post("https://id.twitch.tv/oauth2/token")
+            .send_form(&[
+                ("client_id", client_id),
+                ("client_secret", &client_secret),
+                ("grant_type", "client_credentials"),
+            ])?;
+
+        let mut json = resp.into_json::<Value>()?;
+
+        Ok(take_str!(
+            json,
+            "access_token",
+            AccessTokenError::ParseAccessToken
+        ))
+    }
+
+    fn fetch_page(&mut self, after: Option<&str>) -> Result<FetchStreams, AppError> {
+        let url = self.url.set_after(after);
+
+        let resp = self
+            .agent
+            .get(url)
+            .set("Authorization", &self.auth_header)
+            .set("Client-Id", &self.client_id)
+            .call()?;
+
+        let limits = Limits::from_response(&resp);
+
+        let mut json: Value = resp.into_json()?;
+
+        let next_page = match json
+            .get_mut("pagination")
+            .and_then(|v| v.get_mut("cursor"))
+            .map(Value::take)
+        {
+            Some(Value::String(s)) => Some(s),
+            _ => None,
+        };
+
+        let entries = match json.get_mut("data") {
+            Some(Value::Array(a)) => a
+                .iter_mut()
+                .map(Entry::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => Err(AppError::ParseJson)?,
+        };
+
+        Ok(FetchStreams {
+            entries,
+            next_page,
+            limits,
+        })
+    }
+
+    /// Fetches every page, filling `self.table` with matching entries. Prints a progress dot per page.
+    fn fetch_all(&mut self) -> Result<(usize, Option<Limits>), AppError> {
+        let mut total = 0;
+        let mut page = None;
+        let mut last_limits;
+
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+
+        loop {
+            let streams = self.fetch_page(page.as_deref())?;
+
+            write!(out, ".")?;
+            out.flush()?;
+
+            total += streams.entries.len();
+            page = streams.next_page;
+
+            for entry in streams.entries {
+                if entry.matches(&self.filter) {
+                    self.table.push(entry);
+                }
+            }
+
+            last_limits = streams.limits;
+
+            if page.is_none() {
+                break;
+            }
+        }
+
+        writeln!(out)?;
+
+        Ok((total, last_limits))
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -344,50 +608,25 @@ fn main() {
         std::process::exit(1);
     });
 }
+
 fn run() -> Result<(), AppError> {
     let args = Args::parse();
-    let search_terms = args.term;
-    let word_boundary = args.word;
-    let all = args.all;
-    let lang = args.lang;
+    let filter = Filter::from_args(args);
 
-    let exclude = exclusions(args.exclude);
+    println!("Searching for {:?}", filter.search_terms);
 
-    println!("Searching for {search_terms:?}");
+    let mut client = TwitchClient::new(filter)?;
 
-    let access_token = aquire_access_token()?;
+    let (total, last_limits) = client.fetch_all()?;
 
-    let mut table: Table<5> = Table::new();
-    table.set_align(2, Align::Right);
-    table.set_align(3, Align::Right);
+    client.table.print()?;
 
-    let mut total = 0;
-    let mut page = None;
-    loop {
-        let (entries, next_page) = fetch_streams(&access_token, page)?;
-
-        print!(".");
-        std::io::stdout().flush()?;
-
-        total += entries.len();
-        page = next_page;
-
-        for entry in entries {
-            if entry.matches(word_boundary, all, &search_terms, &exclude, &lang) {
-                table.push(entry.format_row());
-            }
-        }
-
-        if page.is_none() {
-            break;
-        }
-    }
-    println!();
-
-    table.print();
-
-    let matched = table.len();
+    let matched = client.table.len();
     println!("Done ({matched}/{total})");
+
+    if let Some(limits) = last_limits {
+        limits.print_warning_if_low();
+    }
 
     Ok(())
 }
