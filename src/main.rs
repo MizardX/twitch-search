@@ -6,7 +6,7 @@ use chrono::prelude::*;
 use clap::Parser;
 use serde_json::Value;
 use thiserror::Error;
-use ureq::Response;
+use ureq::{Body, http::Response};
 
 // -----------------------------------------------------------------------------
 //     - Errors -
@@ -422,14 +422,9 @@ impl StreamsUrl {
 fn configure_agent() -> ureq::Agent {
     let proxy = env::var("https_proxy")
         .ok()
-        .and_then(|p| ureq::Proxy::new(p).ok());
+        .and_then(|p| ureq::Proxy::new(&p).ok());
 
-    let mut agent = ureq::AgentBuilder::new();
-    if let Some(proxy) = proxy {
-        agent = agent.proxy(proxy);
-    }
-
-    agent.build()
+    ureq::Agent::config_builder().proxy(proxy).build().into()
 }
 
 struct Limits {
@@ -439,14 +434,14 @@ struct Limits {
 }
 
 impl Limits {
-    fn from_response(resp: &Response) -> Option<Self> {
+    fn from_response(resp: &Response<Body>) -> Option<Self> {
+        let parse_header =
+            |name| -> Option<i64> { resp.headers().get(name)?.to_str().ok()?.parse().ok() };
+
         Some(Self {
-            limit: resp.header("Ratelimit-Limit")?.parse::<i64>().ok()?,
-            remaining: resp.header("Ratelimit-Remaining")?.parse::<i64>().ok()?,
-            reset: DateTime::from_timestamp(
-                resp.header("Ratelimit-Reset")?.parse::<i64>().ok()?,
-                0,
-            )?,
+            limit: parse_header("Ratelimit-Limit")?,
+            remaining: parse_header("Ratelimit-Remaining")?,
+            reset: DateTime::from_timestamp(parse_header("Ratelimit-Reset")?, 0)?,
         })
     }
 
@@ -506,15 +501,13 @@ impl TwitchClient {
         let client_secret =
             env::var("TWITCH_CLIENT_SECRET").map_err(|_| AccessTokenError::MissingClientSecret)?;
 
-        let resp = agent
-            .post("https://id.twitch.tv/oauth2/token")
-            .send_form(&[
-                ("client_id", client_id),
-                ("client_secret", &client_secret),
-                ("grant_type", "client_credentials"),
-            ])?;
+        let mut resp = agent.post("https://id.twitch.tv/oauth2/token").send_form([
+            ("client_id", client_id),
+            ("client_secret", client_secret.as_str()),
+            ("grant_type", "client_credentials"),
+        ])?;
 
-        let mut json = resp.into_json::<Value>()?;
+        let mut json = resp.body_mut().read_json::<Value>()?;
 
         Ok(take_str!(
             json,
@@ -526,16 +519,16 @@ impl TwitchClient {
     fn fetch_page(&mut self, after: Option<&str>) -> Result<FetchStreams, AppError> {
         let url = self.url.set_after(after);
 
-        let resp = self
+        let mut resp = self
             .agent
             .get(url)
-            .set("Authorization", &self.auth_header)
-            .set("Client-Id", &self.client_id)
+            .header("Authorization", &self.auth_header)
+            .header("Client-Id", &self.client_id)
             .call()?;
 
         let limits = Limits::from_response(&resp);
 
-        let mut json: Value = resp.into_json()?;
+        let mut json: Value = resp.body_mut().read_json()?;
 
         let next_page = match json
             .get_mut("pagination")
